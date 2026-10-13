@@ -6,6 +6,7 @@ package subscriptions_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -910,5 +911,131 @@ func TestForgetTestState_ClearsAndCallsRecorderForget(t *testing.T) {
 	}
 	if results := rec.snapshotResults(); len(results) != 0 {
 		t.Errorf("after ForgetTestState, NotifyTestEvent should be a no-op, got %+v", results)
+	}
+}
+
+// -- SSE mode: MetricDelivery "sse" --
+
+// TestEnsureSubscriptions_SSEMode confirms that when MetricDelivery is "sse":
+//   - any existing MetricReport push subscription is deleted (transition cleanup)
+//   - no new MetricReport push subscription is created
+//   - the alert subscription is still created as normal
+func TestEnsureSubscriptions_SSEMode(t *testing.T) {
+	c := newClientWith(t, bmcObject(testBMCName, vendorDellInc, modelR650))
+	res := &fakeResolver{}
+	res.set(makeResolved(), nil)
+	fc := &fakeClient{}
+	// Seed an existing MetricReport push subscription from before the SSE transition.
+	fc.setSubscriptions([]subscriptions.Subscription{
+		{URI: subURIMetric, Destination: metricReportDest, EventFormat: eventFormatMetricReport},
+	})
+	r := newRec(t, c, dellSSEMatch(), res, &fakeFactory{client: fc})
+
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The existing MetricReport push subscription must be deleted.
+	deletes := fc.snapshotDeletes()
+	if !slices.Contains(deletes, subURIMetric) {
+		t.Errorf("SSE mode: expected MetricReport push subscription %q deleted; deletes=%v", subURIMetric, deletes)
+	}
+
+	// No new MetricReport push subscription must be created.
+	for _, ev := range fc.snapshotCreates() {
+		if ev.format == schemas.MetricReportEventFormatType {
+			t.Errorf("SSE mode: MetricReport push subscription must not be created (got dest=%q)", ev.dest)
+		}
+	}
+
+	// The alert subscription must still be created.
+	var gotAlert bool
+	for _, ev := range fc.snapshotCreates() {
+		if ev.format == schemas.EventEventFormatType {
+			gotAlert = true
+		}
+	}
+	if !gotAlert {
+		t.Error("SSE mode: alert subscription was not created")
+	}
+}
+
+// TestReconcileOne_SSE_CallsSSEManager confirms that Reconcile calls
+// SSEManager.SetBMC with the correct bmcName and an SSE URL when
+// MetricDelivery is "sse".
+func TestReconcileOne_SSE_CallsSSEManager(t *testing.T) {
+	c := newClientWith(t, bmcObject(testBMCName, vendorDellInc, modelR650))
+	res := &fakeResolver{}
+	res.set(makeResolved(), nil)
+	mgr := &fakeSSEManager{}
+	r := newRec(t, c, dellSSEMatch(), res, &fakeFactory{client: &fakeClient{}})
+	r.SSEManager = mgr
+
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	sets := mgr.snapshotSets()
+	if len(sets) != 1 {
+		t.Fatalf("SetBMC calls: got %d, want 1", len(sets))
+	}
+	if sets[0].bmcName != testBMCName {
+		t.Errorf("SetBMC bmcName: got %q, want %q", sets[0].bmcName, testBMCName)
+	}
+	if !strings.Contains(sets[0].sseURL, "/redfish/v1/SSE") {
+		t.Errorf("SetBMC URL missing /redfish/v1/SSE: %q", sets[0].sseURL)
+	}
+	if !strings.Contains(sets[0].sseURL, "filter") {
+		t.Errorf("SetBMC URL missing filter param: %q", sets[0].sseURL)
+	}
+	if !strings.Contains(sets[0].sseURL, "MetricReport") {
+		t.Errorf("SetBMC URL missing MetricReport in filter: %q", sets[0].sseURL)
+	}
+}
+
+// TestTearDown_SSE_CallsRemoveBMC confirms that SSEManager.RemoveBMC is
+// called when a BMC with a deletion timestamp is reconciled.
+func TestTearDown_SSE_CallsRemoveBMC(t *testing.T) {
+	c := newClientWith(t, bmcObjectBeingDeleted(testBMCName, vendorDellInc, modelR650))
+	res := &fakeResolver{}
+	res.set(makeResolved(), nil)
+	mgr := &fakeSSEManager{}
+	r := newRec(t, c, dellSSEMatch(), res, &fakeFactory{client: &fakeClient{}})
+	r.SSEManager = mgr
+
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	removes := mgr.snapshotRemoves()
+	if !slices.Contains(removes, testBMCName) {
+		t.Errorf("RemoveBMC not called for %q; removes=%v", testBMCName, removes)
+	}
+}
+
+// TestSSEStart_DeferredOnPushCleanupFailure verifies that when the push
+// MetricReport subscription cannot be deleted (transition cleanup fails),
+// SSEManager.SetBMC is NOT called — no SSE goroutine is started while a
+// push subscription is still live on the BMC.
+func TestSSEStart_DeferredOnPushCleanupFailure(t *testing.T) {
+	c := newClientWith(t, bmcObject(testBMCName, vendorDellInc, modelR650))
+	res := &fakeResolver{}
+	res.set(makeResolved(), nil)
+	fc := &fakeClient{
+		deleteErr: fmt.Errorf("BMC returned 500"),
+	}
+	fc.setSubscriptions([]subscriptions.Subscription{
+		{URI: subURIMetric, Destination: metricReportDest, EventFormat: eventFormatMetricReport},
+	})
+	mgr := &fakeSSEManager{}
+	r := newRec(t, c, dellSSEMatch(), res, &fakeFactory{client: fc})
+	r.SSEManager = mgr
+
+	if _, err := r.Reconcile(context.Background(), req()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if sets := mgr.snapshotSets(); len(sets) != 0 {
+		t.Errorf("SetBMC should not be called when push cleanup fails; got %v", sets)
 	}
 }

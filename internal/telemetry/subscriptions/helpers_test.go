@@ -379,6 +379,71 @@ func serverObject(name, bmcName, manufacturer, model string) *metalv1alpha1.Serv
 	}
 }
 
+// fakeSSEManager records SetBMC/RemoveBMC calls for SSE lifecycle assertions.
+// It also simulates the URL cache: ActiveURL returns the URL from the last
+// SetBMC call for that BMC (or "" if RemoveBMC was called since), mirroring
+// what Collector.ActiveURL does with its active map. This exercises the
+// reconciler's cache-hit path (skipping GetServerSentEventURI) in tests.
+type fakeSSEManager struct {
+	mu          sync.Mutex
+	setCalls    []setBMCCall
+	removeCalls []string
+	activeURLs  map[string]string
+}
+
+type setBMCCall struct {
+	bmcName string
+	sseURL  string
+}
+
+func (m *fakeSSEManager) SetBMC(bmcName, sseURL string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setCalls = append(m.setCalls, setBMCCall{bmcName: bmcName, sseURL: sseURL})
+	if m.activeURLs == nil {
+		m.activeURLs = make(map[string]string)
+	}
+	m.activeURLs[bmcName] = sseURL
+}
+
+func (m *fakeSSEManager) RemoveBMC(bmcName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removeCalls = append(m.removeCalls, bmcName)
+	delete(m.activeURLs, bmcName)
+}
+
+// ActiveURL returns the URL from the most recent SetBMC call for bmcName,
+// or "" if RemoveBMC was called since or SetBMC was never called.
+func (m *fakeSSEManager) ActiveURL(bmcName string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeURLs[bmcName]
+}
+
+func (m *fakeSSEManager) snapshotSets() []setBMCCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]setBMCCall, len(m.setCalls))
+	copy(out, m.setCalls)
+	return out
+}
+
+func (m *fakeSSEManager) snapshotRemoves() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.removeCalls))
+	copy(out, m.removeCalls)
+	return out
+}
+
+// dellSSEMatch returns a Config where the Dell entry uses MetricDelivery "sse".
+func dellSSEMatch() *subscriptions.Config {
+	return &subscriptions.Config{EventBasedHardware: []subscriptions.HardwareMatch{
+		{Vendor: vendorDellInc, Models: []string{"*"}, TestMessageId: testMessageId, MetricDelivery: "sse"},
+	}}
+}
+
 // newClientWithServerIndex is newClientWith + a Server field index for
 // spec.bmcRef.name, required for client.MatchingFields in bmcRefWithServerFallback.
 func newClientWithServerIndex(t *testing.T, objs ...client.Object) client.Client {

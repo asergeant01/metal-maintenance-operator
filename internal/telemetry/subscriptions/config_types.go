@@ -5,9 +5,12 @@ package subscriptions
 
 import "time"
 
-// APIVersion is the expected value of Config.APIVersion.
-// Hard-reject ConfigMaps that carry a different value.
-const APIVersion = "telemetry.metal.ironcore.dev/v1alpha1"
+// APIVersion is the current Config schema version.
+const APIVersion = "telemetry.metal.ironcore.dev/v1alpha2"
+
+// APIVersionV1Alpha1 is accepted for backward compatibility during the
+// transition from static allowlist to capability-discovery-driven subscriptions.
+const APIVersionV1Alpha1 = "telemetry.metal.ironcore.dev/v1alpha1"
 
 // Config is the schema for the operator's event-push telemetry
 // configuration. Breaking changes must bump APIVersion.
@@ -47,6 +50,29 @@ type Config struct {
 	// Defaults to 30s when zero (and TestEventInterval > 0).
 	TestEventTimeout time.Duration `yaml:"testEventTimeout,omitempty"`
 
+	// CapabilityCacheTTL is how long a cached capability snapshot on a BMC
+	// annotation is considered fresh before the operator re-probes. Defaults
+	// to 24 hours when zero. Firmware version changes invalidate the cache
+	// regardless of TTL.
+	CapabilityCacheTTL time.Duration `yaml:"capabilityCacheTTL,omitempty"`
+
+	// ExcludedHardware is the deny-list: BMCs matching any row here are never
+	// subscribed regardless of Redfish capability. Useful for known-broken
+	// firmware versions. Rows use the same vendor/model/firmware selector as
+	// HardwareOverrides.
+	ExcludedHardware []HardwareMatch `yaml:"excludedHardware,omitempty"`
+
+	// HardwareOverrides provides per-vendor/model delivery-mode and test-event
+	// configuration. A matching row enables SSE delivery (opt-in) and/or
+	// supplies the testMessageId / testSeverity / testOriginOfCondition values
+	// required by vendor-specific SubmitTestEvent implementations. When absent,
+	// push delivery is used and test events are skipped.
+	HardwareOverrides []HardwareMatch `yaml:"hardwareOverrides,omitempty"`
+
+	// EventBasedHardware is retained for backward compatibility with v1alpha1
+	// ConfigMaps. Rows here are treated identically to HardwareOverrides during
+	// the transition period; the allowlist gating behaviour is removed.
+	// Deprecated: migrate rows to hardwareOverrides or excludedHardware.
 	EventBasedHardware []HardwareMatch `yaml:"eventBasedHardware,omitempty"`
 }
 
@@ -89,4 +115,9 @@ type HardwareMatch struct {
 	// When empty the field is omitted entirely — required for Dell and
 	// Lenovo compatibility. HPE iLO requires this field to be set.
 	TestOriginOfCondition string `yaml:"testOriginOfCondition,omitempty"`
+
+	// MetricDelivery controls how MetricReport data is collected from this BMC.
+	// "sse" opens a persistent SSE connection to the BMC's ServerSentEventUri;
+	// "" or "push" (default) creates a MetricReport HTTP POST subscription.
+	MetricDelivery string `yaml:"metricDelivery,omitempty"`
 }

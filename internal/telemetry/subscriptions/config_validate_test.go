@@ -272,6 +272,23 @@ eventBasedHardware:
 	}
 }
 
+func TestValidate_MetricDelivery_ValidValues(t *testing.T) {
+	for _, v := range []string{"", "push", "sse"} {
+		cfg := minimalValid()
+		cfg.EventBasedHardware = []HardwareMatch{{Vendor: vendorDellInc, Models: []string{"*"}, MetricDelivery: v}}
+		if errs := Validate(cfg); len(errs) != 0 {
+			t.Errorf("MetricDelivery %q should be valid, got: %v", v, errs)
+		}
+	}
+}
+
+func TestValidate_MetricDelivery_InvalidValue(t *testing.T) {
+	cfg := minimalValid()
+	cfg.EventBasedHardware = []HardwareMatch{{Vendor: vendorDellInc, Models: []string{"*"}, MetricDelivery: "grpc"}}
+	errs := Validate(cfg)
+	assertFieldError(t, errs, "metricDelivery")
+}
+
 // assertFieldError checks that at least one error in errs mentions the given field path.
 func assertFieldError(t *testing.T, errs field.ErrorList, fieldPath string) {
 	t.Helper()

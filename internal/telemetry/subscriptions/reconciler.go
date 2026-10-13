@@ -14,8 +14,10 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/ironcore-dev/controller-utils/clientutils"
+	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/capability"
 	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/sink"
 	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
+	"github.com/stmcginnis/gofish"
 	"github.com/stmcginnis/gofish/schemas"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -95,6 +97,12 @@ type BMCReconciler struct {
 	// health-check results (success/failure) via RecordTestResult after
 	// each SubmitTestEvent round-trip. Nil disables recording.
 	TestRecorder TestResultRecorder
+
+	// SSEManager manages per-BMC outbound SSE connections. When set and
+	// a HardwareMatch has MetricDelivery "sse", SetBMC is called after
+	// subscription reconcile; RemoveBMC is called on teardown.
+	// Nil disables SSE management (default: push-mode MetricReport subscriptions).
+	SSEManager SSEManager
 
 	Log logr.Logger
 
@@ -255,8 +263,6 @@ func (r *BMCReconciler) perBMCTimeout() time.Duration {
 func (r *BMCReconciler) reconcileOne(ctx context.Context, bmc *metalv1alpha1.BMC) {
 	ref := r.bmcRefWithServerFallback(ctx, bmc)
 	cfg := r.Config()
-	hw := SubscribeToBMC(ref, cfg)
-	wantSubscribed := hw != nil
 
 	ctx, cancel := context.WithTimeout(ctx, r.perBMCTimeout())
 	defer cancel()
@@ -278,6 +284,22 @@ func (r *BMCReconciler) reconcileOne(ctx context.Context, bmc *metalv1alpha1.BMC
 		return
 	}
 	defer c.Logout()
+
+	// Probe capabilities and derive subscription strategy. The probe result
+	// is cached on the BMC annotation (24h TTL, invalidated by firmware change).
+	// When the live client cannot provide a gofish API client (e.g. in tests),
+	// probeCapabilities returns nil and SelectStrategy falls back to the static
+	// HardwareOverride / EventBasedHardware gate.
+	caps := r.probeCapabilities(ctx, c, bmc, ref.FirmwareVersion, cfg)
+	strategy := SelectStrategy(caps, ref, cfg)
+	wantSubscribed := strategy.WantEvents || strategy.WantMetrics
+	if !wantSubscribed {
+		r.Log.V(1).Info("Skipping subscriptions for BMC",
+			"bmc", ref.Name, "reason", strategy.SkipReason)
+	} else if strategy.SkipReason != "" {
+		r.Log.V(1).Info("Partial subscription: metric delivery skipped",
+			"bmc", ref.Name, "reason", strategy.SkipReason)
+	}
 
 	existing, err := c.ListEventSubscriptions(ctx)
 	if err != nil {
@@ -305,14 +327,42 @@ func (r *BMCReconciler) reconcileOne(ctx context.Context, bmc *metalv1alpha1.BMC
 				"bmc", ref.Name, "err", err.Error())
 			return
 		}
-		r.ensureSubscriptions(ctx, c, ref.Name, current)
-		r.maybeRunTestEvent(ctx, c, ref.Name, cfg, hw)
+		if err := r.ensureSubscriptions(ctx, c, ref.Name, current, strategy); err != nil {
+			// Push subscription cleanup failed in SSE mode; SSE start is deferred
+			// until the next reconcile so push and SSE don't run simultaneously.
+			r.Log.V(1).Info("Deferring SSE start; push subscription cleanup incomplete",
+				"bmc", ref.Name, "err", err.Error())
+		} else if r.SSEManager != nil {
+			if strategy.DeliveryMode == DeliverySSE {
+				// Always resolve the SSE URL via sseURLFor so that a URL change
+				// (e.g. after a firmware update) is picked up on the next reconcile.
+				// When GetServerSentEventURI fails transiently, sseURLFor preserves
+				// the active goroutine's URL so a healthy connection isn't restarted.
+				// SetBMC is a no-op when the URL is unchanged.
+				activeURL := r.SSEManager.ActiveURL(ref.Name)
+				r.SSEManager.SetBMC(ref.Name, r.sseURLFor(ctx, c, resolved, activeURL))
+			} else {
+				// BMC was previously in SSE mode and has now been reconfigured
+				// to push mode; cancel the outbound SSE goroutine.
+				r.SSEManager.RemoveBMC(ref.Name)
+			}
+		} else if strategy.DeliveryMode == DeliverySSE {
+			// SSE was selected but no SSEManager is wired up. ensureSubscriptions
+			// already deleted the push MetricReport subscription, so metrics are
+			// now being dropped. Log an error so the misconfiguration is visible.
+			r.Log.Error(nil, "SSE delivery selected but SSEManager is nil; metrics will be lost",
+				"bmc", ref.Name)
+		}
+		r.maybeRunTestEvent(ctx, c, ref.Name, cfg, strategy)
 	} else {
 		// BMC isn't in the event-based set (or was and is no longer):
 		// tear off any subscriptions we previously created here, then
 		// release the finalizer if we still hold one — otherwise a
 		// future BMC delete would block on us for a BMC we no longer
 		// manage.
+		if r.SSEManager != nil {
+			r.SSEManager.RemoveBMC(ref.Name)
+		}
 		if err := r.deleteSubscriptions(ctx, c, ref.Name, current); err != nil {
 			r.Log.V(1).Info("Failed to remove all subscriptions; keeping finalizer",
 				"bmc", ref.Name, "err", err.Error())
@@ -326,6 +376,10 @@ func (r *BMCReconciler) reconcileOne(ctx context.Context, bmc *metalv1alpha1.BMC
 }
 
 func (r *BMCReconciler) tearDownOne(ctx context.Context, bmcName string) {
+	if r.SSEManager != nil {
+		r.SSEManager.RemoveBMC(bmcName)
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, r.perBMCTimeout())
 	defer cancel()
 
@@ -355,35 +409,78 @@ func (r *BMCReconciler) tearDownOne(ctx context.Context, bmcName string) {
 	_ = r.deleteSubscriptions(ctx, c, bmcName, append(current, stale...))
 }
 
-// ensureSubscriptions converges `current` to exactly one MetricReport
-// subscription and one Event subscription, both pointing at our receiver.
-func (r *BMCReconciler) ensureSubscriptions(ctx context.Context, c Client, bmcName string, current []Subscription) {
+// ensureSubscriptions converges `current` subscriptions to the desired state.
+// In push mode (default), this is exactly one MetricReport subscription and
+// one Event subscription pointing at our receiver. In SSE mode
+// (strategy.DeliveryMode == DeliverySSE), any existing MetricReport push subscriptions
+// are removed (transition cleanup) and no new one is created — metric delivery
+// happens via the SSE stream instead. When strategy.WantMetrics is false but
+// strategy.WantEvents is true, existing MetricReport subscriptions are removed
+// and only the alert subscription is maintained.
+// An error is returned when push subscription cleanup fails in SSE mode so
+// that the caller can defer starting the SSE goroutine until cleanup succeeds
+// (preventing simultaneous push and SSE delivery). Alert subscription
+// management always runs regardless of the cleanup outcome.
+func (r *BMCReconciler) ensureSubscriptions(ctx context.Context, c Client, bmcName string, current []Subscription, strategy *SubscriptionStrategy) error {
 	metrics, alerts := groupByFormat(current)
 
-	if keep, extras := pickAndExtras(metrics); len(extras) > 0 {
-		r.Log.V(1).Info("Deduplicating metric subscriptions",
-			"bmc", bmcName, "keep", keep.URI, "removed", len(extras))
-		_ = r.deleteSubscriptions(ctx, c, bmcName, extras)
+	useSSE := strategy.DeliveryMode == DeliverySSE
+	wantMetrics := strategy.WantMetrics
+
+	var firstErr error
+	if useSSE {
+		// SSE mode: remove any existing MetricReport push subscriptions that
+		// were created before the transition, then leave metrics alone.
+		if len(metrics) > 0 {
+			r.Log.V(1).Info("SSE mode: removing MetricReport push subscriptions",
+				"bmc", bmcName, "count", len(metrics))
+			if err := r.deleteSubscriptions(ctx, c, bmcName, metrics); err != nil {
+				firstErr = err // save; continue to alert subscription logic
+			}
+		}
+	} else if wantMetrics {
+		if keep, extras := pickAndExtras(metrics); len(extras) > 0 {
+			r.Log.V(1).Info("Deduplicating metric subscriptions",
+				"bmc", bmcName, "keep", keep.URI, "removed", len(extras))
+			if err := r.deleteSubscriptions(ctx, c, bmcName, extras); err != nil {
+				r.Log.V(1).Info("Failed to deduplicate metric subscriptions",
+					"bmc", bmcName, "err", err.Error())
+			}
+		}
+		if len(metrics) == 0 {
+			dest := r.destinationFor("metricsreport", bmcName)
+			uri, err := c.CreateEventSubscription(
+				ctx, dest,
+				schemas.MetricReportEventFormatType,
+				schemas.RetryForeverDeliveryRetryPolicy,
+			)
+			if err != nil {
+				r.Log.V(1).Info("Failed to create metrics subscription",
+					"bmc", bmcName, "destination", dest, "err", err.Error())
+			} else {
+				r.Log.V(1).Info("Created metrics subscription",
+					"bmc", bmcName, "uri", uri)
+			}
+		}
+	} else {
+		// Events-only mode (WantEvents=true, WantMetrics=false, e.g. TelemetryService
+		// absent or LegacyMetricReport): remove any MetricReport push subscriptions
+		// that may have been created before the capability snapshot changed.
+		if len(metrics) > 0 {
+			r.Log.V(1).Info("Removing MetricReport subscriptions (metrics not wanted)",
+				"bmc", bmcName, "count", len(metrics))
+			if err := r.deleteSubscriptions(ctx, c, bmcName, metrics); err != nil {
+				firstErr = err
+			}
+		}
 	}
+
 	if keep, extras := pickAndExtras(alerts); len(extras) > 0 {
 		r.Log.V(1).Info("Deduplicating alert subscriptions",
 			"bmc", bmcName, "keep", keep.URI, "removed", len(extras))
-		_ = r.deleteSubscriptions(ctx, c, bmcName, extras)
-	}
-
-	if len(metrics) == 0 {
-		dest := r.destinationFor("metricsreport", bmcName)
-		uri, err := c.CreateEventSubscription(
-			ctx, dest,
-			schemas.MetricReportEventFormatType,
-			schemas.RetryForeverDeliveryRetryPolicy,
-		)
-		if err != nil {
-			r.Log.V(1).Info("Failed to create metrics subscription",
-				"bmc", bmcName, "destination", dest, "err", err.Error())
-		} else {
-			r.Log.V(1).Info("Created metrics subscription",
-				"bmc", bmcName, "uri", uri)
+		if err := r.deleteSubscriptions(ctx, c, bmcName, extras); err != nil {
+			r.Log.V(1).Info("Failed to deduplicate alert subscriptions",
+				"bmc", bmcName, "err", err.Error())
 		}
 	}
 
@@ -402,6 +499,7 @@ func (r *BMCReconciler) ensureSubscriptions(ctx context.Context, c Client, bmcNa
 				"bmc", bmcName, "uri", uri)
 		}
 	}
+	return firstErr
 }
 
 func groupByFormat(subs []Subscription) (metrics, alerts []Subscription) {
@@ -584,11 +682,11 @@ const (
 // interval has elapsed since the last test for this BMC. It also enforces
 // the deadline for any pending test that has not yet been confirmed, recording
 // a failure if it expired.
-func (r *BMCReconciler) maybeRunTestEvent(ctx context.Context, c Client, bmcName string, cfg *Config, hw *HardwareMatch) {
+func (r *BMCReconciler) maybeRunTestEvent(ctx context.Context, c Client, bmcName string, cfg *Config, strategy *SubscriptionStrategy) {
 	if cfg == nil || cfg.TestEventInterval <= 0 {
 		return
 	}
-	if hw == nil || hw.TestMessageId == "" {
+	if strategy.TestEvent == nil {
 		return
 	}
 
@@ -620,9 +718,9 @@ func (r *BMCReconciler) maybeRunTestEvent(ctx context.Context, c Client, bmcName
 	}
 
 	params := TestEventParams{
-		MessageId:         hw.TestMessageId,
-		Severity:          hw.TestSeverity,
-		OriginOfCondition: hw.TestOriginOfCondition,
+		MessageId:         strategy.TestEvent.MessageId,
+		Severity:          strategy.TestEvent.Severity,
+		OriginOfCondition: strategy.TestEvent.OriginOfCondition,
 	}
 	if err := c.SubmitTestEvent(ctx, params); err != nil {
 		r.Log.V(1).Info("Failed to submit test event", "bmc", bmcName, "err", err.Error())
@@ -669,3 +767,95 @@ func (r *BMCReconciler) ForgetTestState(bmcName string) {
 var _ interface {
 	Reconcile(context.Context, ctrl.Request) (ctrl.Result, error)
 } = (*BMCReconciler)(nil)
+
+// sseURIGetter is satisfied by extendedClient in the runtime package.
+// Using a local unexported interface avoids adding SSE URI to the public
+// Client interface that test fakes must implement.
+type sseURIGetter interface {
+	GetServerSentEventURI(ctx context.Context) (string, error)
+}
+
+// gofishAPIProvider is satisfied by extendedClient in the runtime package.
+// Allows probeCapabilities to extract the underlying gofish client without
+// adding it to the public Client interface that test fakes must implement.
+// When a Client does not implement this interface (e.g. in tests), capability
+// probing is skipped and SelectStrategy falls back to the static config gate.
+type gofishAPIProvider interface {
+	GofishAPIClient() *gofish.APIClient
+}
+
+// probeCapabilities returns the cached or freshly-probed Redfish capability
+// snapshot for bmc. Returns nil when the client does not expose a gofish API
+// (e.g. test fakes) or when the live probe fails — in both cases SelectStrategy
+// falls back to the static HardwareOverride / EventBasedHardware gate.
+func (r *BMCReconciler) probeCapabilities(ctx context.Context, c Client, bmc *metalv1alpha1.BMC, firmwareVersion string, cfg *Config) *capability.Capabilities {
+	ttl := capability.DefaultCacheTTL
+	if cfg != nil && cfg.CapabilityCacheTTL > 0 {
+		ttl = cfg.CapabilityCacheTTL
+	}
+	if caps, ok := capability.GetCached(bmc, ttl); ok {
+		return caps
+	}
+	apiProvider, ok := c.(gofishAPIProvider)
+	if !ok {
+		return nil
+	}
+	caps, err := capability.Probe(ctx, apiProvider.GofishAPIClient(), firmwareVersion)
+	if err != nil {
+		r.Log.V(1).Info("Capability probe failed", "bmc", bmc.Name, "err", err.Error())
+		return nil
+	}
+	if err := capability.PersistCached(ctx, r.Client, bmc, caps); err != nil {
+		r.Log.V(1).Info("Failed to cache capabilities annotation", "bmc", bmc.Name, "err", err.Error())
+	}
+	return caps
+}
+
+func (r *BMCReconciler) sseURLFor(ctx context.Context, c Client, resolved *Resolved, activeURL string) string {
+	base := BMCEndpoint(resolved.BMC) + "/redfish/v1/SSE" // static fallback
+	if getter, ok := c.(sseURIGetter); ok {
+		uri, err := getter.GetServerSentEventURI(ctx)
+		if err == nil && uri != "" {
+			if abs := r.resolveSSEURI(uri, resolved); abs != "" {
+				base = abs
+			} else {
+				// resolveSSEURI returned "" — the BMC-reported URI is malformed or
+				// uses an unrecognised scheme. Fall back to the static path so the
+				// operator can investigate the logged URI rather than a silent 404.
+				r.Log.V(1).Info("BMC SSE URI unresolvable, using static fallback",
+					"bmc", resolved.BMC.Name, "uri", uri)
+			}
+		} else if activeURL != "" {
+			// Either GetServerSentEventURI returned a hard error (transient BMC
+			// management plane failure) or returned ("", nil) meaning the BMC
+			// is not reporting an SSE endpoint right now (e.g. mid-firmware-reset).
+			// In both cases, preserve the running goroutine's URL so a healthy
+			// SSE stream is not restarted unnecessarily.
+			return activeURL
+		}
+	}
+	// Use url.Parse to strip any pre-existing query string from base (avoids
+	// double-? if the URI already carries query params).
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	// url.QueryEscape uses form-encoding (space → '+') and url.Values.Encode()
+	// percent-encodes '$' to '%24' — both break OData system query options.
+	// Build the raw query with RFC 3986 percent-encoding (space → %20).
+	const filterValue = "EventFormatType eq 'MetricReport'"
+	encoded := strings.NewReplacer(" ", "%20", "'", "%27").Replace(filterValue)
+	u.RawQuery = "$filter=" + encoded
+	return u.String()
+}
+
+// resolveSSEURI resolves uri (which may be relative) against the BMC origin.
+// Returns the absolute URL string, or "" if validation fails (parse error,
+// cross-origin, etc.).
+func (r *BMCReconciler) resolveSSEURI(uri string, resolved *Resolved) string {
+	result, err := ResolveSameOriginURL(uri, BMCEndpoint(resolved.BMC))
+	if err != nil {
+		return ""
+	}
+	return result
+}

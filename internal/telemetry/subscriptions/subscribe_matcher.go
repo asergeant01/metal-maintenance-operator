@@ -9,22 +9,50 @@ import (
 	"github.com/blang/semver/v4"
 )
 
-// SubscribeToBMC decides whether the reconciler should keep Redfish
-// event subscriptions on this BMC. It returns the matching HardwareMatch
-// row (which carries vendor-specific settings like TestMessageId), or nil
-// if no row matches and subscriptions should not be created.
-func SubscribeToBMC(ref BMCRef, cfg *Config) *HardwareMatch {
+// IsExcluded reports whether the BMC matches any row in cfg.ExcludedHardware.
+// Excluded BMCs are never subscribed regardless of Redfish capability.
+func IsExcluded(ref BMCRef, cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return findMatch(ref, cfg.ExcludedHardware) != nil
+}
+
+// FindOverride returns the first HardwareMatch row from cfg.HardwareOverrides
+// or cfg.EventBasedHardware that matches the BMC. The result supplies optional
+// delivery-mode overrides and vendor-specific SubmitTestEvent parameters.
+// Returns nil when no override row matches.
+func FindOverride(ref BMCRef, cfg *Config) *HardwareMatch {
 	if cfg == nil {
 		return nil
 	}
-	// An unknown vendor (informer hasn't populated Status yet, or BMC
-	// never reported one) does not qualify — we have no signal that
-	// this BMC supports subscriptions.
+	// HardwareOverrides takes precedence; fall back to EventBasedHardware
+	// for backward compatibility with v1alpha1 configs.
+	if m := findMatch(ref, cfg.HardwareOverrides); m != nil {
+		return m
+	}
+	return findMatch(ref, cfg.EventBasedHardware)
+}
+
+// SubscribeToBMC is kept for backward compatibility with tests and callers
+// that have not yet been migrated to FindOverride. It searches both
+// HardwareOverrides and EventBasedHardware (the former takes precedence) and
+// returns the first matching row, or nil if none match.
+//
+// Deprecated: use FindOverride for new code. The allowlist gate semantics
+// (return nil = do not subscribe) are superseded by SelectStrategy.
+func SubscribeToBMC(ref BMCRef, cfg *Config) *HardwareMatch {
+	return FindOverride(ref, cfg)
+}
+
+// findMatch searches rows for the first entry that matches ref by
+// vendor, model, and minimum firmware version.
+func findMatch(ref BMCRef, rows []HardwareMatch) *HardwareMatch {
 	if ref.Vendor == "" {
 		return nil
 	}
-	for i := range cfg.EventBasedHardware {
-		hw := &cfg.EventBasedHardware[i]
+	for i := range rows {
+		hw := &rows[i]
 		if !vendorMatches(hw.Vendor, ref.Vendor) {
 			continue
 		}

@@ -66,13 +66,14 @@ func NewMetricReportSinkWithLogger(reg prometheus.Registerer, log logr.Logger) (
 	return s, nil
 }
 
-// PublishSamples holds the lock across BOTH the series-map mutation
-// and gauge.Set so a concurrent Forget can't delete bookkeeping
-// between us recording the key and writing the gauge.
+// PublishSamples holds s.mu across both the series-map mutation and the
+// gauge writes so a concurrent Forget cannot delete a series between us
+// recording the key and writing the gauge value.
 func (s *MetricReportSink) PublishSamples(_ context.Context, bmcName string, samples []sink.Sample) error {
 	if len(samples) == 0 {
 		return nil
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

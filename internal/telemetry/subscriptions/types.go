@@ -87,3 +87,15 @@ type Client interface {
 type ClientFactory interface {
 	NewClient(ctx context.Context, r *Resolved) (Client, error)
 }
+
+// SSEManager manages per-BMC outbound SSE connections for MetricReport delivery.
+// Nil disables SSE (tests that don't care about SSE leave the reconciler field unset).
+type SSEManager interface {
+	SetBMC(bmcName, sseURL string)
+	RemoveBMC(bmcName string)
+	// ActiveURL returns the SSE URL of the currently-running goroutine for
+	// bmcName, or "" if no goroutine is active. Used by the reconciler to
+	// preserve a healthy goroutine's URL on a transient GetServerSentEventURI
+	// failure, and to skip RemoveBMC when no goroutine is running.
+	ActiveURL(bmcName string) string
+}

@@ -28,6 +28,7 @@ import (
 	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/criticalevent"
 	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/events"
 	promsink "github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/sink/prometheus"
+	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/ssestream"
 	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/subscriptions"
 	"github.com/ironcore-dev/metal-maintenance-operator/internal/telemetry/warningevent"
 	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
@@ -174,6 +175,14 @@ func AddTo(mgr manager.Manager, opts Options) error {
 	// BMCReconciler watches metalv1alpha1.BMC objects through the
 	// controller-runtime cache and converges each BMC's Redfish event
 	// subscriptions. See internal/telemetry/subscriptions/reconciler.go.
+	sseCollector := ssestream.NewCollector(
+		resolver, metricSink, opts.InsecureTLS,
+		ctrl.Log.WithName("telemetry").WithName("sse"),
+	)
+	if err := mgr.Add(sseCollector); err != nil {
+		return fmt.Errorf("add SSE collector: %w", err)
+	}
+
 	subReconciler := &subscriptions.BMCReconciler{
 		Client:           mgr.GetClient(),
 		Config:           loader.Config,
@@ -185,6 +194,7 @@ func AddTo(mgr manager.Manager, opts Options) error {
 		TestRecorder:     testSink,
 		ReceiverURL:      opts.ReceiverURL,
 		SubscriberID:     opts.SubscriberID,
+		SSEManager:       sseCollector,
 		// ReconcileInterval and PerBMCTimeout intentionally unset:
 		// the reconciler reads them from the live ConfigMap at use
 		// site, falling back to its internal defaults when the
@@ -273,6 +283,14 @@ type extendedClient struct {
 	api *gofish.APIClient
 }
 
+// GofishAPIClient exposes the underlying *gofish.APIClient for use by the
+// capability prober. The interface is satisfied by extendedClient in the
+// runtime package; test fakes do not implement it, causing the reconciler
+// to fall back to the static config-override path.
+func (c *extendedClient) GofishAPIClient() *gofish.APIClient {
+	return c.api
+}
+
 func (c *extendedClient) ListEventSubscriptions(_ context.Context) ([]subscriptions.Subscription, error) {
 	svc := c.api.GetService()
 	if svc == nil {
@@ -295,6 +313,18 @@ func (c *extendedClient) ListEventSubscriptions(_ context.Context) ([]subscripti
 		})
 	}
 	return out, nil
+}
+
+func (c *extendedClient) GetServerSentEventURI(_ context.Context) (string, error) {
+	svc := c.api.GetService()
+	if svc == nil {
+		return "", fmt.Errorf("no service root")
+	}
+	es, err := svc.EventService()
+	if err != nil {
+		return "", err
+	}
+	return es.ServerSentEventURI, nil
 }
 
 func (c *extendedClient) SubmitTestEvent(_ context.Context, params subscriptions.TestEventParams) error {

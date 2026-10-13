@@ -26,6 +26,9 @@ const (
 
 	minTestEventTimeout = 5 * time.Second
 	maxTestEventTimeout = 5 * time.Minute
+
+	minCapabilityCacheTTL = 5 * time.Minute
+	maxCapabilityCacheTTL = 7 * 24 * time.Hour
 )
 
 var knownVendors = map[bmc.Manufacturer]struct{}{
@@ -76,9 +79,9 @@ func Validate(cfg *Config) field.ErrorList {
 	root := field.NewPath("")
 
 	// apiVersion
-	if cfg.APIVersion != APIVersion {
+	if cfg.APIVersion != APIVersion && cfg.APIVersion != APIVersionV1Alpha1 {
 		errs = append(errs, field.Invalid(root.Child("apiVersion"), cfg.APIVersion,
-			fmt.Sprintf("must be %q", APIVersion)))
+			fmt.Sprintf("must be %q (or %q for legacy configs)", APIVersion, APIVersionV1Alpha1)))
 	}
 
 	if cfg.SubscriptionReconcileInterval == 0 {
@@ -107,48 +110,57 @@ func Validate(cfg *Config) field.ErrorList {
 			fmt.Sprintf("must be between %s and %s when set", minTestEventTimeout, maxTestEventTimeout)))
 	}
 
-	// metrics — no allow-list validated here. The collector publishes every
-	// numeric value from every MetricReport on the BMC; metric selection
-	// happens at Prometheus scrape time via metric_relabel_configs.
+	// capabilityCacheTTL — optional; zero means use the default (24h).
+	if cfg.CapabilityCacheTTL != 0 && (cfg.CapabilityCacheTTL < minCapabilityCacheTTL || cfg.CapabilityCacheTTL > maxCapabilityCacheTTL) {
+		errs = append(errs, field.Invalid(root.Child("capabilityCacheTTL"), cfg.CapabilityCacheTTL,
+			fmt.Sprintf("must be between %s and %s when set", minCapabilityCacheTTL, maxCapabilityCacheTTL)))
+	}
 
-	// eventBasedHardware — vendor must be a canonical metal-operator
-	// bmc.Manufacturer value, models non-empty (and individually
-	// non-blank), valid semver for MinFirmware. Multiple rows per vendor
-	// are allowed to support per-model overrides (e.g. different
-	// testMessageId for old vs new firmware).
-	for i, hw := range cfg.EventBasedHardware {
-		hwPath := root.Child("eventBasedHardware").Index(i)
+	// Validate hardware match rows for all three lists.
+	validateHardwareRows(&errs, root.Child("excludedHardware"), cfg.ExcludedHardware, false)
+	validateHardwareRows(&errs, root.Child("hardwareOverrides"), cfg.HardwareOverrides, cfg.TestEventInterval > 0)
+	validateHardwareRows(&errs, root.Child("eventBasedHardware"), cfg.EventBasedHardware, cfg.TestEventInterval > 0)
+
+	return errs
+}
+
+// validateHardwareRows validates a slice of HardwareMatch rows at the given
+// field path. requireTestMessageId enforces that each row has a TestMessageId
+// when testEventInterval is configured.
+func validateHardwareRows(errs *field.ErrorList, path *field.Path, rows []HardwareMatch, requireTestMessageId bool) {
+	for i, hw := range rows {
+		hwPath := path.Index(i)
 		vendor := strings.TrimSpace(hw.Vendor)
 		switch {
 		case vendor == "":
-			errs = append(errs, field.Required(hwPath.Child("vendor"), ""))
+			*errs = append(*errs, field.Required(hwPath.Child("vendor"), ""))
 		case hw.Vendor != vendor || !isKnownVendor(vendor):
-			// Reject non-canonical values up front. hw.Vendor != vendor
-			// catches whitespace-padded forms (e.g. " Dell Inc. ") that
-			// would pass validation but never match the exact-compare
-			// runtime path in vendorMatches.
-			errs = append(errs, field.NotSupported(hwPath.Child("vendor"), hw.Vendor, supportedVendorList))
+			*errs = append(*errs, field.NotSupported(hwPath.Child("vendor"), hw.Vendor, supportedVendorList))
 		}
 		if len(hw.Models) == 0 {
-			errs = append(errs, field.Required(hwPath.Child("models"), "at least one model or \"*\" required"))
+			*errs = append(*errs, field.Required(hwPath.Child("models"), "at least one model or \"*\" required"))
 		} else {
 			for j, model := range hw.Models {
 				if strings.TrimSpace(model) == "" {
-					errs = append(errs, field.Invalid(hwPath.Child("models").Index(j), model,
+					*errs = append(*errs, field.Invalid(hwPath.Child("models").Index(j), model,
 						"model entries must not be blank"))
 				}
 			}
 		}
 		if hw.MinFirmware != "" {
 			if _, err := semver.ParseTolerant(hw.MinFirmware); err != nil {
-				errs = append(errs, field.Invalid(hwPath.Child("minFirmware"), hw.MinFirmware,
+				*errs = append(*errs, field.Invalid(hwPath.Child("minFirmware"), hw.MinFirmware,
 					fmt.Sprintf("must be a valid semver: %v", err)))
 			}
 		}
-		if cfg.TestEventInterval > 0 && hw.TestMessageId == "" {
-			errs = append(errs, field.Required(hwPath.Child("testMessageId"),
+		if requireTestMessageId && hw.TestMessageId == "" {
+			*errs = append(*errs, field.Required(hwPath.Child("testMessageId"),
 				"required when testEventInterval is set"))
 		}
+		switch hw.MetricDelivery {
+		case "", "push", "sse":
+		default:
+			*errs = append(*errs, field.NotSupported(hwPath.Child("metricDelivery"), hw.MetricDelivery, []string{"push", "sse"}))
+		}
 	}
-	return errs
 }

@@ -5,7 +5,6 @@ package runtime
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,13 +29,11 @@ type BMCMetricFetcher struct {
 // whose transport is cloned from http.DefaultTransport so idle-connection
 // pooling and timeouts are retained.
 func NewBMCMetricFetcher(resolver subscriptions.Resolver, insecureTLS bool, log logr.Logger) *BMCMetricFetcher {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecureTLS} //nolint:gosec
 	return &BMCMetricFetcher{
 		Resolver: resolver,
 		Log:      log,
 		client: &http.Client{
-			Transport:     tr,
+			Transport:     subscriptions.NewBMCTransport(insecureTLS, 0),
 			Timeout:       30 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
@@ -85,23 +82,19 @@ func (f *BMCMetricFetcher) FetchMetricReport(ctx context.Context, bmcName, odata
 // carry no userinfo.
 func resolveODataURL(odataID, bmcEndpoint string) (string, error) {
 	const metricReportsPath = "/redfish/v1/TelemetryService/MetricReports/"
-	parsed, err := url.Parse(odataID)
+	// ResolveSameOriginURL validates same-origin and returns abs.String() — a
+	// well-formed URL that url.Parse will always accept. Parse it again here
+	// only to access the structured abs.Path and abs.User fields.
+	rawAbs, err := subscriptions.ResolveSameOriginURL(odataID, bmcEndpoint)
 	if err != nil {
-		return "", fmt.Errorf("parse odataID: %w", err)
+		return "", err
 	}
-	origin, err := url.Parse(bmcEndpoint)
-	if err != nil {
-		return "", fmt.Errorf("parse BMC endpoint: %w", err)
-	}
-	abs := origin.ResolveReference(parsed)
+	abs, _ := url.Parse(rawAbs) // rawAbs is well-formed output of ResolveSameOriginURL
 	if !strings.HasPrefix(abs.Path, metricReportsPath) {
 		return "", fmt.Errorf("odataID %q is not under %s", odataID, metricReportsPath)
-	}
-	if abs.Scheme != origin.Scheme || abs.Host != origin.Host {
-		return "", fmt.Errorf("odataID %q resolves outside BMC origin %s", odataID, origin.Host)
 	}
 	if abs.User != nil {
 		return "", fmt.Errorf("odataID %q contains userinfo", odataID)
 	}
-	return abs.String(), nil
+	return rawAbs, nil
 }
